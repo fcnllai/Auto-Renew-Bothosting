@@ -2,7 +2,7 @@
 
 这是一个基于 GitHub Actions 的自动化脚本，用于定时登录自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
 
-⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点,[B2proxy住宅代理](https://www.b2proxy.com/signup?code=0F5133)
+⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
