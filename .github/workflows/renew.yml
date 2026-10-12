@@ -4,28 +4,58 @@ on:
   schedule:
     # 主触发：UTC 18:32 = 北京时间 02:32
     - cron: '32 18 * * *'
-    # 兜底触发：UTC 20:32 = 北京时间 04:32
-    # 作用：主触发若恰好落在「距上次续期还差几分钟」的冷却窗口里，会因未到时间而空跑；
-    #       2 小时后的这一次距上次成功已超过 24 小时，必定能续上。
-    - cron: '32 20 * * *'
+    # 兜底触发：UTC 18:52 = 北京时间 02:52，紧贴主触发只隔 20 分钟。
+    # 定位：只防 GitHub 把主触发整次丢掉（schedule 会随机丢点）；
+    #       不承担「补差几分钟」的职责 —— 那由脚本内的自锚定等待解决。
+    # 为什么必须贴身：兜底若离主触发太远（比如 2 小时），一旦兜底成功，
+    #       续期锚点就被拽到兜底时刻，次日主触发永远差几小时 —— 问题在兜底时间重演。
+    #       贴身 20 分钟后两者运行窗口重叠，无论谁成功锚点都落在同一位置。
+    - cron: '52 18 * * *'
   workflow_dispatch:
+
+# 主触发与兜底可能重叠，强制串行：后到的排队等前一个结束，绝不并发操作同一账号。
+# 排队期间不启动 job，不消耗 runner 分钟数。
+concurrency:
+  group: renew-bothosting
+  cancel-in-progress: false
 
 jobs:
   Renew-bot:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     permissions:
       actions: write
       contents: read
 
     steps:
+      # ── 守卫：今天已经成功续期过，本班次直接跳过 ──
+      # 兜底触发绝大多数时候都会命中这里，日常开销从 8 分钟降到几秒钟。
+      - name: 🔍 检查今日是否已成功续期
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          n=$(gh run list --workflow=renew.yml --limit=30 --json conclusion,createdAt \
+                --jq "[.[] | select(.conclusion==\"success\" and (.createdAt|startswith(\"$today\")))] | length")
+          echo "今日已成功的运行数: $n"
+          if [ "$n" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v6
+        if: steps.guard.outputs.skip != 'true'
 
       - name: ⚙ 设置 Python
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
+        if: steps.guard.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
@@ -33,13 +63,19 @@ jobs:
           seleniumbase install chromedriver
 
       - name: ⚙ 设置代理 (sing-box)
+        if: steps.guard.outputs.skip != 'true'
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期脚本（含自动等待重试）
+      # ── 核心：自锚定等待 ──
+      # 若未到续期时间且倒计时 ≤ 60 分钟，就原地等到冷却结束再续期。
+      # 60 分钟覆盖了「cron 触发 → 实际点按钮」的最大抖动（调度延迟 ≤30min + 脚本前置 ≤10min）。
+      # 效果：一旦某天续期落在时刻 X，之后每天都会「等到 X 再续」，锚点钉死、永不漂移。
+      - name: 🚀 运行续期脚本（含自锚定等待）
+        if: steps.guard.outputs.skip != 'true'
         env:
           EMAIL: ${{ secrets.EMAIL }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -48,8 +84,8 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          MAX_ATTEMPTS=3       # 最多尝试次数
-          MAX_WAIT_MIN=25      # 单次最多原地等待多少分钟
+          MAX_ATTEMPTS=2       # 等待后重跑一次即可，不需要更多
+          MAX_WAIT_MIN=60      # 单次最多原地等待 60 分钟（覆盖最大起跑抖动）
           for i in $(seq 1 $MAX_ATTEMPTS); do
             echo "========== 第 $i / $MAX_ATTEMPTS 次尝试 =========="
             set +e
@@ -75,11 +111,11 @@ jobs:
 
               if [ "$secs" -le $(( MAX_WAIT_MIN * 60 )) ] && [ "$i" -lt "$MAX_ATTEMPTS" ]; then
                 wait_s=$(( secs + 90 ))
-                echo "🕐 等待 ${wait_s} 秒（倒计时归零 + 90 秒缓冲）后重试..."
+                echo "🕐 等待 ${wait_s} 秒（倒计时归零 + 90 秒缓冲）后重跑..."
                 sleep "$wait_s"
                 continue
               fi
-              echo "⏳ 剩余时间超过等待上限，或重试次数已用尽 —— 交给下一次 cron 兜底"
+              echo "⏳ 剩余时间超过等待上限 —— 交给下一班次兜底，锚点不动"
               exit 0
             fi
 
