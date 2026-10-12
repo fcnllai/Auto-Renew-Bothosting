@@ -1,6 +1,7 @@
 ## 🚀 Bot-hosting 自动续期（GitHub Actions）
 
 这是一个基于 GitHub Actions 的自动化脚本，用于定时登录自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
+
 在原作基础上优化了运行时间重叠造成当日签到失败的问题。
 
 ⚠️ 有Cloudflare盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点
