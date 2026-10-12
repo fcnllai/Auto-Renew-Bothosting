@@ -2,7 +2,12 @@ name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    - cron: '32 18 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+    # 主触发：UTC 18:32 = 北京时间 02:32
+    - cron: '32 18 * * *'
+    # 兜底触发：UTC 20:32 = 北京时间 04:32
+    # 作用：主触发若恰好落在「距上次续期还差几分钟」的冷却窗口里，会因未到时间而空跑；
+    #       2 小时后的这一次距上次成功已超过 24 小时，必定能续上。
+    - cron: '32 20 * * *'
   workflow_dispatch:
 
 jobs:
@@ -34,7 +39,7 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期脚本
+      - name: 🚀 运行续期脚本（含自动等待重试）
         env:
           EMAIL: ${{ secrets.EMAIL }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -43,7 +48,44 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          xvfb-run --auto-servernum python3 app.py
+          MAX_ATTEMPTS=3       # 最多尝试次数
+          MAX_WAIT_MIN=25      # 单次最多原地等待多少分钟
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "========== 第 $i / $MAX_ATTEMPTS 次尝试 =========="
+            set +e
+            xvfb-run --auto-servernum python3 -u app.py 2>&1 | tee renew_run.log
+            set -e
+
+            if grep -q "续期成功" renew_run.log; then
+              echo "✅ 第 $i 次尝试：续期成功，收工"
+              exit 0
+            fi
+
+            if grep -q "未到续期时间" renew_run.log; then
+              cd_txt=$(grep -o '倒计时: [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' renew_run.log | head -1 | awk '{print $2}')
+              if [ -n "$cd_txt" ]; then
+                h=$(echo "$cd_txt" | cut -d: -f1)
+                m=$(echo "$cd_txt" | cut -d: -f2)
+                s=$(echo "$cd_txt" | cut -d: -f3)
+                secs=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+              else
+                secs=999999
+              fi
+              echo "⏳ 距可续期还有 ${secs} 秒"
+
+              if [ "$secs" -le $(( MAX_WAIT_MIN * 60 )) ] && [ "$i" -lt "$MAX_ATTEMPTS" ]; then
+                wait_s=$(( secs + 90 ))
+                echo "🕐 等待 ${wait_s} 秒（倒计时归零 + 90 秒缓冲）后重试..."
+                sleep "$wait_s"
+                continue
+              fi
+              echo "⏳ 剩余时间超过等待上限，或重试次数已用尽 —— 交给下一次 cron 兜底"
+              exit 0
+            fi
+
+            echo "ℹ️ 未匹配到已知状态，直接结束本次"
+            exit 0
+          done
 
       - name: 🧽 清理进程和临时文件
         if: always()
@@ -52,19 +94,26 @@ jobs:
           pkill -f chromedriver || true
           pkill -f chrome || true
           pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          rm -f sing-box sing-box-config.json sing-box.log renew_run.log
 
-      - name: 🧹 清理旧的工作流运行记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+      # ─────────────────────────────────────────────────────────────
+      # 原「🧹 清理旧的工作流运行记录」步骤已移除。
+      # 它执行 gh run delete，把除最新一次以外的运行记录全部删掉，
+      # 导致 Actions 页面看不到历史、total_count 恒为 0，
+      # 排查定时任务时被严重误导。运行记录由 GitHub 自动保留 90 天，无需手动清理。
+      # 若你仍想保留该步骤，把下面这段取消注释、粘回 steps 末尾即可：
+      #
+      # - name: 🧹 清理旧的工作流运行记录
+      #   if: always()
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+      #     count=0
+      #     for run_id in $runs; do
+      #       count=$((count + 1))
+      #       if [ $count -gt 1 ]; then
+      #         gh run delete $run_id || true
+      #       fi
+      #     done
+      # ─────────────────────────────────────────────────────────────
