@@ -2,15 +2,15 @@ name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    # 主触发：UTC 18:32 = 北京时间 02:32
-    - cron: '32 18 * * *'
-    # 兜底触发：UTC 18:52 = 北京时间 02:52，紧贴主触发只隔 20 分钟。
-    # 定位：只防 GitHub 把主触发整次丢掉（schedule 会随机丢点）；
+    # 主触发：UTC 00:52 = 北京时间 08:52
+    - cron: '52 0 * * *'
+    # 兜底触发：UTC 01:12 = 北京时间 09:12，紧贴主触发只隔 20 分钟。
+    # 定位：只防 GitHub 把主触发整次丢掉，或主触发执行失败时补一次；
     #       不承担「补差几分钟」的职责 —— 那由脚本内的自锚定等待解决。
     # 为什么必须贴身：兜底若离主触发太远（比如 2 小时），一旦兜底成功，
     #       续期锚点就被拽到兜底时刻，次日主触发永远差几小时 —— 问题在兜底时间重演。
     #       贴身 20 分钟后两者运行窗口重叠，无论谁成功锚点都落在同一位置。
-    - cron: '52 18 * * *'
+    - cron: '12 1 * * *'
   workflow_dispatch:
 
 # 主触发与兜底可能重叠，强制串行：后到的排队等前一个结束，绝不并发操作同一账号。
@@ -28,42 +28,14 @@ jobs:
       contents: read
 
     steps:
-      # ── 守卫：今天已经成功续期过，本班次直接跳过 ──
-      # 兜底触发绝大多数时候都会命中这里，日常开销从 8 分钟降到几秒钟。
-      # 手动触发（workflow_dispatch）时跳过守卫 —— 手动即明确意图，强制跑完整流程。
-      - name: 🔍 检查今日是否已成功续期
-        id: guard
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          today=$(date -u +%Y-%m-%d)
-          # 必须用 -R 显式指定仓库：本 step 在 checkout 之前运行，目录里没有 .git，
-          # gh 无法从 git remote 推断当前仓库，会报 "not a git repository" 直接失败。
-          n=$(gh run list -R "${{ github.repository }}" --workflow=renew.yml --limit=30 \
-                --json conclusion,createdAt \
-                --jq "[.[] | select(.conclusion==\"success\" and (.createdAt|startswith(\"$today\")))] | length" \
-                2>/dev/null) || n=0
-          # guard 自身出错时宁可继续跑（skip=false），不能因噎废食漏掉今天的续期
-          [ -z "$n" ] && n=0
-          echo "今日已成功的运行数: $n"
-          if [ "$n" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v6
-        if: steps.guard.outputs.skip != 'true'
 
       - name: ⚙ 设置 Python
-        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
-        if: steps.guard.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
@@ -71,7 +43,6 @@ jobs:
           seleniumbase install chromedriver
 
       - name: ⚙ 设置代理 (sing-box)
-        if: steps.guard.outputs.skip != 'true'
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
@@ -82,8 +53,18 @@ jobs:
       # 若未到续期时间且倒计时 ≤ 60 分钟，就原地等到冷却结束再续期。
       # 60 分钟覆盖了「cron 触发 → 实际点按钮」的最大抖动（调度延迟 ≤30min + 脚本前置 ≤10min）。
       # 效果：一旦某天续期落在时刻 X，之后每天都会「等到 X 再续」，锚点钉死、永不漂移。
+      #
+      # 关于「防重复续期」：这里刻意不用 guard 查历史 run 记录。
+      #   曾尝试加 guard 查「今日是否已有 success run」来跳过兜底，但它的判断依据
+      #   （run 的 conclusion）根本不可靠 ——
+      #     ① app.py 的失败路径几乎全是 exit 0，conclusion 恒为 success，真假续期无法区分，
+      #        主触发失败时兜底会被误判为「已成功」而不补；
+      #     ② 被 guard 跳过的 run 其 conclusion 也是 success，会「跳过一次就永远连锁跳过」。
+      #   要修对只能逐条下载 run 日志 grep「续期成功」，复杂度与失败风险远超收益。
+      #   故砍掉 guard，交给 app.py 自带的「未到续期时间」判断天然防重复：
+      #   主触发若已成功，兜底跑起来会看到「Renew in 23:xx」，app.py 判定未到时间、空跑退出，
+      #   绝不会重复点续期。代价只是兜底每天约 8 分钟空跑，值得。
       - name: 🚀 运行续期脚本（含自锚定等待）
-        if: steps.guard.outputs.skip != 'true'
         env:
           EMAIL: ${{ secrets.EMAIL }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -123,13 +104,17 @@ jobs:
                 sleep "$wait_s"
                 continue
               fi
-              echo "⏳ 剩余时间超过等待上限 —— 交给下一班次兜底，锚点不动"
+              echo "⏳ 剩余时间超过等待上限 —— 本次空跑（今天已续过 / 冷却期未到），锚点不动"
               exit 0
             fi
 
-            echo "ℹ️ 未匹配到已知状态，直接结束本次"
-            exit 0
+            # 既没「续期成功」也没「未到续期时间」= 登录失败 / Turnstile 未过 / 结果未知。
+            # 标记为失败（exit 1）让这次 run 在 Actions 页面显示红色，便于一眼识别、及时介入。
+            echo "❌ 未匹配到已知状态，本次标记为失败"
+            exit 1
           done
+          # 循环内所有分支都会 exit，正常到不了这里；兜底保险
+          exit 1
 
       - name: 🧽 清理进程和临时文件
         if: always()
