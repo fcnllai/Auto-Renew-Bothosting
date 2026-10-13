@@ -30,14 +30,22 @@ jobs:
     steps:
       # ── 守卫：今天已经成功续期过，本班次直接跳过 ──
       # 兜底触发绝大多数时候都会命中这里，日常开销从 8 分钟降到几秒钟。
+      # 手动触发（workflow_dispatch）时跳过守卫 —— 手动即明确意图，强制跑完整流程。
       - name: 🔍 检查今日是否已成功续期
         id: guard
+        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           today=$(date -u +%Y-%m-%d)
-          n=$(gh run list --workflow=renew.yml --limit=30 --json conclusion,createdAt \
-                --jq "[.[] | select(.conclusion==\"success\" and (.createdAt|startswith(\"$today\")))] | length")
+          # 必须用 -R 显式指定仓库：本 step 在 checkout 之前运行，目录里没有 .git，
+          # gh 无法从 git remote 推断当前仓库，会报 "not a git repository" 直接失败。
+          n=$(gh run list -R "${{ github.repository }}" --workflow=renew.yml --limit=30 \
+                --json conclusion,createdAt \
+                --jq "[.[] | select(.conclusion==\"success\" and (.createdAt|startswith(\"$today\")))] | length" \
+                2>/dev/null) || n=0
+          # guard 自身出错时宁可继续跑（skip=false），不能因噎废食漏掉今天的续期
+          [ -z "$n" ] && n=0
           echo "今日已成功的运行数: $n"
           if [ "$n" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
