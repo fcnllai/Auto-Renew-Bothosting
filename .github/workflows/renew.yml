@@ -132,17 +132,17 @@ jobs:
       # 排查定时任务时被严重误导。运行记录由 GitHub 自动保留 90 天，无需手动清理。
       # 若你仍想保留该步骤，把下面这段取消注释、粘回 steps 末尾即可：
       #
-      # - name: 🧹 清理旧的工作流运行记录
-      #   if: always()
-      #   env:
-      #     GH_TOKEN: ${{ github.token }}
-      #   run: |
-      #     runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-      #     count=0
-      #     for run_id in $runs; do
-      #       count=$((count + 1))
-      #       if [ $count -gt 1 ]; then
-      #         gh run delete $run_id || true
-      #       fi
-      #     done
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              gh run delete $run_id || true
+            fi
+          done
       # ─────────────────────────────────────────────────────────────
