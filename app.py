@@ -160,6 +160,18 @@ def format_countdown(countdown_str: str) -> str:
     except:
         return countdown_str
 
+# 判断是否为「前序刚续期成功」：倒计时落在 23~24 小时区间
+# 原理：兜底触发只比主触发晚 20 分钟。若本次跑起来看到倒计时是 23:4x:xx，
+#       说明不到 1 小时前已有人成功续期 —— 那就是前序（主触发）已经干成了。
+#       此时应静默退出：不推送通知、不重复操作，也不标记失败。
+def is_recently_renewed(countdown_str: str, hours_threshold: int = 23) -> bool:
+    try:
+        h = int(str(countdown_str).split(':')[0])
+        return hours_threshold <= h <= 24
+    except Exception:
+        return False
+
+
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
@@ -552,14 +564,19 @@ def main():
         else:
             if countdown_text:
                 friendly = format_countdown(countdown_text)
-                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-                send_telegram_message(
-                    format_notification(
-                        "⏳ 未到续期时间",
-                        extra=f"⏱️ 可续期时间: {friendly}后",
-                        expiry_date=current_expiry or "（未获取到）"
+                if is_recently_renewed(countdown_text):
+                    # 倒计时 23~24 小时 → 不到 1 小时前刚续期过 → 前序（主触发）已成功
+                    # 静默处理：不推送通知、不重复操作；SESSION_TOKEN 仍照常刷新
+                    print(f"✅ 前序已续期完成（倒计时 {countdown_text}），本次无需操作，不发通知")
+                else:
+                    print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
+                    send_telegram_message(
+                        format_notification(
+                            "⏳ 未到续期时间",
+                            extra=f"⏱️ 可续期时间: {friendly}后",
+                            expiry_date=current_expiry or "（未获取到）"
+                        )
                     )
-                )
             else:
                 print("ℹ️ 未找到续期按钮或倒计时，状态未知")
                 send_telegram_message(
