@@ -81,6 +81,13 @@ jobs:
             xvfb-run --auto-servernum python3 -u app.py 2>&1 | tee renew_run.log
             set -e
 
+            # 前序已续期完成（倒计时 23~24 小时）→ 说明主触发刚成功过，
+            # 本次是兜底，没必要再动手，也不该标失败。静默收工。
+            if grep -q "前序已续期完成" renew_run.log; then
+              echo "✅ 前序已完成续期（倒计时 23~24 小时），本次无需操作，收工"
+              exit 0
+            fi
+
             if grep -q "续期成功" renew_run.log; then
               echo "✅ 第 $i 次尝试：续期成功，收工"
               exit 0
@@ -126,23 +133,38 @@ jobs:
           rm -f sing-box sing-box-config.json sing-box.log renew_run.log
 
       # ─────────────────────────────────────────────────────────────
-      # 原「🧹 清理旧的工作流运行记录」步骤已移除。
-      # 它执行 gh run delete，把除最新一次以外的运行记录全部删掉，
-      # 导致 Actions 页面看不到历史、total_count 恒为 0，
-      # 排查定时任务时被严重误导。运行记录由 GitHub 自动保留 90 天，无需手动清理。
-      # 若你仍想保留该步骤，把下面这段取消注释、粘回 steps 末尾即可：
+      # 清理历史运行记录：只保留「当天（UTC）」的记录，更早的全部删除。
       #
-      - name: 🧹 清理旧的工作流运行记录
+      # 为什么按 UTC 算「当天」：
+      #   主触发 UTC 00:52、兜底 UTC 01:12，两次都落在同一个 UTC 日内，
+      #   所以「保留今天」恰好等于「保留今天这两次」。
+      #
+      # 与旧版（只留最新 1 条）的区别：旧版会把当天主触发也删掉，导致只能看到
+      # 最后一条、无法对照两次的结果；新版保留当天全部记录，更早的清零。
+      #
+      # 注意：删掉的历史无法找回。若某天需要回溯排查，把 KEEP_DAYS 调大（如 3 或 7）。
+      - name: 🧹 清理历史运行记录（只保留当天）
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              gh run delete $run_id || true
-            fi
+          KEEP_DAYS=1
+          if [ "$KEEP_DAYS" -le 1 ]; then
+            since=$(date -u +%Y-%m-%d)
+          else
+            since=$(date -u -d "$((KEEP_DAYS - 1)) days ago" +%Y-%m-%d)
+          fi
+          echo "保留 $since 及之后的记录，删除更早的"
+          ids=$(gh run list -R "${{ github.repository }}" --workflow=renew.yml \
+                  --limit=100 --json databaseId,createdAt \
+                  --jq ".[] | select(.createdAt < \"$since\") | .databaseId" \
+                  2>/dev/null) || ids=""
+          if [ -z "$ids" ]; then
+            echo "没有需要删除的历史记录"
+            exit 0
+          fi
+          for id in $ids; do
+            echo "删除运行记录: $id"
+            gh run delete "$id" -R "${{ github.repository }}" || true
           done
       # ─────────────────────────────────────────────────────────────
