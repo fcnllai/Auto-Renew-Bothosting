@@ -523,12 +523,35 @@ def main():
                 print(f"续期按钮点击失败: {e}")
 
             print("⏳ 等待新的过期时间...")
+
+            # 续期确认：点击后 bot-hosting 服务端可能延迟刷新，原先只等 6 秒就读页面，
+            # 经常误判为「结果未知」—— 官网其实已续成功，日志却报未成功。
+            # 改为最多轮询 60 秒：每 10 秒重新加载一次账单页再读，读到新倒计时/新到期日才算确认。
+            CONFIRM_TIMEOUT = 60
+            CONFIRM_INTERVAL = 10
+
             sb.sleep(6)
 
             # 提取新的到期日期和倒计时
             new_page_text = sb.get_page_source()
             new_expiry = extract_expiry_date(new_page_text)
             new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+
+            waited = 0
+            while (not new_match) and (not new_expiry or new_expiry == current_expiry) and waited < CONFIRM_TIMEOUT:
+                sb.sleep(CONFIRM_INTERVAL)
+                waited += CONFIRM_INTERVAL
+                print(f"   …已等 {waited} 秒未读到新的到期信息，重新加载账单页确认")
+                try:
+                    sb.open("https://bot-hosting.net/a/billings")
+                    sb.wait_for_ready_state_complete()
+                    sb.sleep(2)
+                except Exception as e:
+                    print(f"   ⚠️ 重新加载账单页失败: {e}")
+                new_page_text = sb.get_page_source()
+                new_expiry = extract_expiry_date(new_page_text)
+                new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+
             if new_match:
                 new_countdown = new_match.group(1)
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
