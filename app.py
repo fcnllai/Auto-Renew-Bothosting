@@ -453,6 +453,17 @@ def main():
         # 寻找外部续期按钮
         outer_renew_selector = None
         countdown_text = None
+
+        # 页面级倒计时优先判定：
+        # 冷却期内页面上一定存在 "Renew in HH:MM:SS"。只要出现，就说明还没到可续期时间，
+        # 直接走「未到时间」分支 —— 避免被 [class*="renew"] 之类的选择器误匹配到别的元素，
+        # 把冷却期内的按钮当成可点；点下去必然无变化，进而误报「续期可能未成功」。
+        page_html = sb.get_page_source()
+        page_cd = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", page_html)
+        if page_cd:
+            countdown_text = page_cd.group(1)
+            print(f"⏳ 页面显示倒计时 {countdown_text}，判定为未到续期时间")
+
         possible_selectors = [
             'button:contains("Renew")',
             'button:contains("Renew free plan")',
@@ -461,7 +472,8 @@ def main():
             '[class*="Renew"]',
         ]
 
-        for selector in possible_selectors:
+        # 已从页面文本里读到倒计时，就不再找按钮，直接走「未到时间」分支
+        for selector in ([] if countdown_text else possible_selectors):
             try:
                 if sb.is_element_visible(selector):
                     button_text = sb.get_text(selector)
