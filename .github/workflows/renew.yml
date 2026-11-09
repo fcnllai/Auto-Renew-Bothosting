@@ -105,6 +105,18 @@ jobs:
           echo "❌ 未匹配到已知状态，本次标记为失败"
           exit 1
 
+      # 站点改版频繁（2026-11-09 新增人机验证步骤、按钮改中文），
+      # 一旦点击落空，脚本会存一张 renew_click_failed.png。
+      # 这里把它传到 Artifact，Actions 页面即可下载查看，不必再靠人工截图。
+      - name: 📸 上传调试截图（若有）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-debug-screenshot
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
