@@ -563,16 +563,24 @@ def main():
             JS_CLICK_BY_TEXT = JS_VIS_HELPER + """
                 const btns = [...document.querySelectorAll('button')];
                 const target = btns.find(b => vis(b) && !b.disabled && re.test(b.textContent || ''));
-                if (!target) return 'NOT_FOUND';
-                target.click();
-                return 'CLICKED:' + (target.textContent || '').trim();
+                let result = 'NOT_FOUND';
+                if (target) {
+                    target.click();
+                    result = 'CLICKED:' + (target.textContent || '').trim();
+                }
+                return result;
             """
+            # 只查「弹窗内」的按钮是否还在，绝不能全页扫描 ——
+            # 2026-11-09 实测页面上有两个 "Renew for 4 days"（弹窗一个、底部套餐区一个），
+            # 全页扫描必然命中底部那个，导致弹窗已关闭也被判成「仍在」，白跑两轮重试。
             JS_DIALOG_BTN_EXISTS = JS_VIS_HELPER + """
                 const dlg = document.querySelector('div[role="dialog"], [role="dialog"]');
-                const inDlg = dlg ? [...dlg.querySelectorAll('button.btn-primary')].some(vis) : false;
-                const btns = [...document.querySelectorAll('button')];
-                const byText = btns.some(b => vis(b) && re.test(b.textContent || ''));
-                return inDlg || byText;
+                let exists = false;
+                if (dlg) {
+                    exists = [...dlg.querySelectorAll('button.btn-primary')].some(vis)
+                          || [...dlg.querySelectorAll('button')].some(b => vis(b) && re.test(b.textContent || ''));
+                }
+                return exists;
             """
 
             try:
@@ -603,7 +611,19 @@ def main():
                     except Exception as e:
                         print(f"⚠️ 第 {rnd} 轮文案点击异常: {e}")
 
-                time.sleep(4)
+                time.sleep(6)
+
+                # 先看到期日变没变：变了就是真成功，不必纠结弹窗关没关。
+                # （2026-11-09 实测：点击其实已生效，但弹窗关闭有延迟，只看弹窗会误判。）
+                try:
+                    now_expiry = extract_expiry_date(sb.get_page_source())
+                    if now_expiry and current_expiry and now_expiry != current_expiry:
+                        modal_button_clicked = True
+                        print(f"✅ 到期日已更新为 {now_expiry}，续期已生效")
+                        break
+                except Exception:
+                    pass
+
                 try:
                     still_there = sb.execute_script(JS_DIALOG_BTN_EXISTS)
                 except Exception:
