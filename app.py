@@ -522,17 +522,106 @@ def main():
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
-            # 点击续期按钮
+            # ── 点击续期按钮（2026-11-09 改版适配）──
+            # 站点在 11-07 → 11-09 之间改版：弹窗改为中文「续期 4 天」，
+            # 并把流程拆成「1 人机验证 → 通过后按钮才可用」两步。
+            #
+            # 本地原来用 button:contains("Renew for 4 days") 匹配文案，改版后页面
+            # 仍残留含该英文的元素，click 不报错、日志打印「已点击」，但点击实际无效
+            # —— 60 秒页面纹丝不动，后台到期日不动。11-09 两次失败皆出于此。
+            #
+            # 上游 eooce 的 11-09 运行（#187）成功，其做法是不看文案，用
+            #     div[role="dialog"] button.btn-primary
+            # 按「弹窗 + 主按钮」这个结构特征定位，语言和文案怎么改都不受影响。
+            # 本地改为同样的主方案，文案匹配仅作兜底。
+            #
+            # 点击后必须校验后果：弹窗关闭 = 请求已发出；还在 = 点空了，重试。
+            # 可见性判断用 getBoundingClientRect，不能用 offsetParent ——
+            # 弹窗是 position:fixed，其子元素 offsetParent 恒为 null，会全部误判为隐藏。
             print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
+            time.sleep(5)
+
+            DIALOG_BTN_SELECTORS = [
+                'div[role="dialog"] button.btn-primary',   # 上游同款，首选
+                'div[role="dialog"] .btn-primary',
+                '[role="dialog"] button.btn-primary',
+            ]
+
+            JS_VIS_HELPER = """
+                const vis = el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) return false;
+                    const s = getComputedStyle(el);
+                    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+                };
+                const re = /(续期\\s*4\\s*天|Renew\\s*(for\\s*)?4\\s*days)/i;
+            """
+            JS_LIST_BUTTONS = JS_VIS_HELPER + """
+                const btns = [...document.querySelectorAll('button')];
+                return btns.filter(vis).map(b => (b.textContent || '').trim()).filter(t => t.length > 0);
+            """
+            JS_CLICK_BY_TEXT = JS_VIS_HELPER + """
+                const btns = [...document.querySelectorAll('button')];
+                const target = btns.find(b => vis(b) && !b.disabled && re.test(b.textContent || ''));
+                if (!target) return 'NOT_FOUND';
+                target.click();
+                return 'CLICKED:' + (target.textContent || '').trim();
+            """
+            JS_DIALOG_BTN_EXISTS = JS_VIS_HELPER + """
+                const dlg = document.querySelector('div[role="dialog"], [role="dialog"]');
+                const inDlg = dlg ? [...dlg.querySelectorAll('button.btn-primary')].some(vis) : false;
+                const btns = [...document.querySelectorAll('button')];
+                const byText = btns.some(b => vis(b) && re.test(b.textContent || ''));
+                return inDlg || byText;
+            """
+
+            try:
+                visible_btns = sb.execute_script(JS_LIST_BUTTONS)
+                print(f"🔎 当前可见按钮共 {len(visible_btns)} 个：{visible_btns}")
+            except Exception as e:
+                print(f"⚠️ 枚举按钮失败: {e}")
 
             modal_button_clicked = False
-            try:
-                sb.click('button:contains("Renew for 4 days")', timeout=8)
-                modal_button_clicked = True
-                print("✅ 已点击续期按钮")
-            except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+            for rnd in range(1, 4):
+                # 主方案：CSS 定位弹窗主按钮，不看文案
+                hit = False
+                for sel in DIALOG_BTN_SELECTORS:
+                    try:
+                        if sb.is_element_visible(sel):
+                            sb.click(sel, timeout=5)
+                            print(f"🖱️ 第 {rnd} 轮点击弹窗主按钮：{sel}")
+                            hit = True
+                            break
+                    except Exception:
+                        continue
+
+                # 兜底：按中英文文案用 JS 触发
+                if not hit:
+                    try:
+                        ret = sb.execute_script(JS_CLICK_BY_TEXT)
+                        print(f"🖱️ 第 {rnd} 轮改用文案匹配点击 → {ret}")
+                    except Exception as e:
+                        print(f"⚠️ 第 {rnd} 轮文案点击异常: {e}")
+
+                time.sleep(4)
+                try:
+                    still_there = sb.execute_script(JS_DIALOG_BTN_EXISTS)
+                except Exception:
+                    still_there = True
+
+                if not still_there:
+                    modal_button_clicked = True
+                    print("✅ 弹窗已关闭，续期请求已发出")
+                    break
+                print(f"⚠️ 第 {rnd} 轮点击后弹窗仍在，判定未生效，重试")
+
+            if not modal_button_clicked:
+                print("❌ 三轮点击后续期按钮仍在，判定点击未生效")
+                try:
+                    sb.save_screenshot("renew_click_failed.png")
+                    print("📸 已保存现场截图: renew_click_failed.png")
+                except Exception as e:
+                    print(f"⚠️ 截图失败: {e}")
 
             print("⏳ 等待新的过期时间...")
 
