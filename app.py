@@ -74,20 +74,39 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
-# 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30):
-    start = time.time()
-    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
-    while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
-            return True
+# ── Turnstile 真实状态判定（2026-11-13 修复）──
+# 旧写法只看页面里有没有 "verify you are human" 字样，但挑战界面在 iframe 内部，
+# get_page_source() 读不到，于是无论过没过都判定「已通过」—— 带着空 token 提交，
+# 服务端回 error=disconnect。这就是 11-13 登录失败的真正原因，该函数已删除。
+# 唯一可靠判据：表单里的 cf-turnstile-response 有没有值（上游同款做法）。
+TURNSTILE_TOKEN_JS = r"""
+try { if (window.turnstile && window.turnstile.getResponse) {
+        var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
+var el = document.querySelector('input[name="cf-turnstile-response"]');
+return el ? (el.value || '') : '';
+"""
+
+
+def turnstile_token(sb) -> str:
+    """读当前页面的 Turnstile token，空串表示尚未通过。"""
+    try:
+        tok = sb.execute_script(TURNSTILE_TOKEN_JS)
+        return tok if isinstance(tok, str) else ""
+    except Exception:
+        return ""
+
+
+def wait_turnstile_token(sb, timeout=10) -> str:
+    """轮询等待 token 就绪，返回 token；超时返回空串。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        tok = turnstile_token(sb)
+        if tok:
+            return tok
         sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
-    return False
-    
+    return ""
+
+
 # 获取当前出口ip
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
@@ -274,14 +293,24 @@ def main():
                 sb.input('input[type="password"]', PASSWORD)
                 sb.sleep(3)
 
-                # 登录页同样有 Turnstile
-                if not wait_for_turnstile_pass(sb, timeout=25):
-                    print("⚠️ 登录页 Turnstile 未通过，尝试兜底点击...")
-                    try:
-                        sb.uc_gui_click_captcha()
-                        sb.sleep(4)
-                    except Exception as e:
-                        print(f"⚠️ 兜底点击失败: {e}")
+                # 登录页的 Turnstile：必须等到 token 真正写入表单才允许提交。
+                # 拿不到 token 就点验证框，最多三轮，每轮最多等 20 秒。
+                tok = wait_turnstile_token(sb, timeout=10)
+                if not tok:
+                    print("⚠️ 未取得 Turnstile token，尝试点击验证框...")
+                    for attempt in range(1, 4):
+                        try:
+                            sb.uc_gui_click_captcha()
+                        except Exception as e:
+                            print(f"⚠️ 第 {attempt} 次点击验证框失败: {e}")
+                        tok = wait_turnstile_token(sb, timeout=20)
+                        if tok:
+                            break
+                        print(f"⚠️ 第 {attempt} 次点击后仍无 token，重试")
+                if tok:
+                    print(f"✅ Turnstile token 已就绪（{tok[:10]}… 长度 {len(tok)}）")
+                else:
+                    print("❌ 始终未取得 Turnstile token，提交大概率会被拒")
 
                 sb.sleep(1)
                 sb.click('button[type="submit"]')
@@ -387,20 +416,26 @@ def main():
                 return
 
             # 处理弹窗中的 Turnstile
+            # 判据同样改为「token 是否有值」：无感验证常常自动通过，先等 8 秒；
+            # 拿不到再点验证框，最多三轮。
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
-            for attempt in range(1, 4):
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(12)
-                except Exception as e:
-                    print(f"⚠️ 点击 Turnstile 出错: {e}")
+            if wait_turnstile_token(sb, timeout=8):
+                turnstile_passed = True
+                print("✅ 弹窗 Turnstile token 已就绪（无需点击）")
+            else:
+                for attempt in range(1, 4):
+                    try:
+                        sb.uc_gui_click_captcha()
+                        time.sleep(10)
+                    except Exception as e:
+                        print(f"⚠️ 点击 Turnstile 出错: {e}")
 
-                if wait_for_turnstile_pass(sb, timeout=20):
-                    turnstile_passed = True
-                    break
-                else:
-                    print(f"⏳ 第 {attempt} 次未通过，重试点击...")
+                    if wait_turnstile_token(sb, timeout=20):
+                        turnstile_passed = True
+                        print(f"✅ 第 {attempt} 次点击后 token 就绪")
+                        break
+                    print(f"⏳ 第 {attempt} 次仍未取得 token，重试点击...")
 
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
