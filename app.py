@@ -203,6 +203,19 @@ def open_billings(sb) -> str:
             print(f"⚠️ 访问 {path} 异常: {e}")
     return last_url
 
+
+def list_clickable(sb, limit: int = 12):
+    """列出页面上可见按钮/链接的文案 —— 诊断「点的到底是不是目标元素」用。"""
+    try:
+        return sb.execute_script(
+            r"""const els = [...document.querySelectorAll('button,a[role=button]')];
+                 return els.filter(x => x.getBoundingClientRect().width > 0)
+                           .map(x => (x.innerText || '').trim().replace(/\s+/g, ' '))
+                           .filter(t => t).slice(0, %d);""" % limit
+        )
+    except Exception:
+        return []
+
 # 主流程
 def main():
     print("#" * 25)
@@ -245,10 +258,15 @@ def main():
                 sb.wait_for_ready_state_complete()
                 sb.sleep(3)
 
-                # 首屏是登录方式选择页，先点「Continue with email」展开表单
+                # 首屏是登录方式选择页，先点「Continue with email」展开表单。
+                # 注意：这里是盲点第一个 type=submit，若页面上「Continue with Discord」
+                # 排在前面就会被点错，走进 OAuth 后以 error=disconnect 弹回登录页。
+                # 故先打印按钮清单，出问题时一眼能看出点的是哪个。
+                print(f"🔎 登录页按钮: {list_clickable(sb)}")
                 sb.click('button[type="submit"]')
                 sb.sleep(12)
 
+                print(f"🔎 展开后表单页按钮: {list_clickable(sb)}")
                 print("📧 填写邮箱...")
                 sb.input('input[type="email"]', EMAIL)
                 sb.sleep(1)
@@ -280,6 +298,25 @@ def main():
                     login_ok = True
                     print("✅ Password 登录成功, 当前已到达账单页")
                 else:
+                    # 把失败原因码与页面提示抓出来，否则只看到「未到达账单页」无从下手
+                    m_err = re.search(r"[?&]error=([^&]+)", current_url)
+                    if m_err:
+                        code = m_err.group(1)
+                        hint = {
+                            "disconnect": "会话/第三方授权被中断 —— 常见于点错登录方式或 Turnstile token 未生效",
+                            "invalid_credentials": "邮箱或密码不正确",
+                            "access_denied": "账号被拒绝或未完成邮箱验证",
+                        }.get(code, "未收录的错误码")
+                        print(f"🔍 失败原因码: {code} —— {hint}")
+                    for sel in ('[role="alert"]', '.text-red-500', '[class*="error"]', '.alert'):
+                        try:
+                            if sb.is_element_present(sel):
+                                txt = sb.get_text(sel).strip()
+                                if txt:
+                                    print(f"📄 页面提示: {txt[:200]}")
+                                    break
+                        except Exception:
+                            pass
                     print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
             except Exception as e:
                 print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
