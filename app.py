@@ -1,86 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, requests, subprocess
-import urllib.request, urllib.parse, urllib.error
-from datetime import datetime
+# 依赖：os/re/sys/time 基础库，requests 取出口 IP，seleniumbase 驱动浏览器。
+# 旧登录方式相关的 json / subprocess / urllib 及 datetime 均已随代码删除。
+import os, re, sys, time, requests
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
-EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
-SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
+EMAIL         = os.environ.get("EMAIL") or ""           # 登录邮箱,同时也是通知用的账户标识
+PASSWORD      = os.environ.get("PASSWORD") or ""        # bot-hosting 账号密码,唯一登录方式(密码不过期)
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
 
-# 解析 DISCORD_TOKEN
-DC_TOKEN = ""
-if DISCORD_TOKEN:
-    _parts = DISCORD_TOKEN.split(",", 1)
-    DC_TOKEN = _parts[-1].strip()
-
-if not SESSION_TOKEN and not DC_TOKEN:
-    print("ℹ️ 未配置 SESSION_TOKEN 和 DISCORD_TOKEN,脚本终止。")
+# 登录前提校验。
+# 2026-10-21 上游「Add Password login; Remove Discord token login」，注释写明
+# 「密码不过期，唯一登录方式」。2026-11-13 本仓库实测 SESSION_TOKEN 与 Discord OAuth
+# 同时失效 —— 不是 token 过期，是站点把这两个入口拆了。
+# 故彻底移除两种旧登录方式，不再维护，只留 EMAIL + PASSWORD。
+if not (EMAIL and PASSWORD):
+    print("❌ 未配置 EMAIL 或 PASSWORD，无法登录，脚本终止。")
+    print("   EMAIL 必须是 bot-hosting 的登录邮箱；PASSWORD 是账户密码。")
     sys.exit(1)
 
-# 构造cookie
-COOKIES = {
-    "session_token": SESSION_TOKEN,
-    "login": "true",
-    "theme": "system",
-}
-
 # 记录本次登录方式（用于通知）
-_LOGIN_METHOD = "SESSION_TOKEN"
+_LOGIN_METHOD = "Password"
 
-# 获取cookie到期时间
-def get_cookie_info(sb, name):
-    cookies = sb.get_cookies()
-    for c in cookies:
-        if c.get('name') == name:
-            value = c.get('value')
-            expiry_ts = c.get('expiry')
-            expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
-            return value, expiry_dt
-    return None, None
+# 站点基础配置
+BASE_URL = "https://bot-hosting.net"
 
-# 检查是否需要更新cookie
-def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
-    if new_value is None:
-        return False
-    if new_value != old_value:
-        return True
-    if expiry_dt:
-        remaining = (expiry_dt - datetime.now()).total_seconds()
-        if remaining < days_threshold * 24 * 3600:
-            return True
-    return False
-
-# 更新cookie到secrets
-def update_github_secret(secret_name, new_value):
-    if not new_value:
-        print(f"⚠️ 跳过更新 {secret_name}：新值为空")
-        return False
-    masked = new_value[:4] + "..." + new_value[-4:] if len(new_value) > 8 else "***"
-    print(f"🔄 更新 Secret: {secret_name} (新值: {masked})")
-    try:
-        env = os.environ.copy()
-        if GH_TOKEN:
-            env["GH_TOKEN"] = GH_TOKEN
-        proc = subprocess.run(
-            ["gh", "secret", "set", secret_name, "--body", new_value],
-            capture_output=True, text=True, timeout=30, check=False,
-            env=env
-        )
-        if proc.returncode == 0:
-            return True
-        else:
-            print(f"❌ 更新失败: {proc.stderr.strip()}")
-            return False
-    except Exception as e:
-        print(f"❌ 异常: {e}")
-        return False
+# 账单页路径：站点在 2026-11-12 前后把 /a/billings 迁到 /dash/billings
+# （上游同日的提交「页面调整，及时同步」同步改了这一行）。
+# 迁移期常见新旧并存，故两个都试、谁通算谁 —— 只硬编码一个，下次再改版又要瞎一次。
+BILLINGS_PATHS = ("/dash/billings", "/a/billings")
 
 # 发送tg通知
 def send_telegram_message(message: str):
@@ -113,8 +64,7 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
         f"{status}",
         f"👤 登录账户: {masked_email}",
     ]
-    if _LOGIN_METHOD != "SESSION_TOKEN":
-        lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
+    lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
     if expiry_date:
         lines.append(f"📅 到期时间: {expiry_date}")
     if extra:
@@ -172,186 +122,86 @@ def is_recently_renewed(countdown_str: str, hours_threshold: int = 23) -> bool:
         return False
 
 
-# 获取过期日期
+# ── 日期处理 ──
+# 站点 2026-11-12 前后调整了页面，日期写法可能变成 <13 Nov 2026>、<2026-11-13> 等。
+# 旧正则只认 \d{2} 的 YYYY/MM/DD 与 MM/DD/YYYY，格式一变就提取不到，
+# 进而把「续期成功」误判成「结果未知」。这是继登录方式之后最容易中的暗坑。
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+def normalize_date(date_str: str) -> str:
+    """把各种日期写法统一成 YYYY/MM/DD；认不出的原样返回。"""
+    s = (date_str or "").strip()
+    # 13 Nov 2026 / 13 November 2026
+    m = re.match(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", s)
+    if m:
+        mon = _MONTHS.get(m.group(2)[:3].lower())
+        if mon:
+            return f"{m.group(3)}/{mon:02d}/{int(m.group(1)):02d}"
+    # 11/13/2026、2026/11/13、2026-11-13
+    parts = re.split(r"[/-]", re.sub(r"\s+", "", s))
+    if len(parts) == 3:
+        try:
+            if len(parts[0]) == 4:          # YYYY/MM/DD
+                return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
+            if len(parts[2]) == 4:          # MM/DD/YYYY
+                return f"{parts[2]}/{int(parts[0]):02d}/{int(parts[1]):02d}"
+        except ValueError:
+            pass
+    return s
+
+
+# 注意：上游 2026-11-12 那版正则只写了 \d{4}-\d{2}-\d{2}（ISO 横线版），
+# 漏掉了 \d{4}/\d{1,2}/\d{1,2}（斜杠版）。而页面与 TG 通知实际用的就是 2026/11/13 这种写法，
+# 照搬会直接读不到日期 —— 这里用 [-/] 把两种分隔符一并覆盖。
+DATE_RE = (r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+           r"|\d{1,2}/\d{1,2}/\d{4}"
+           r"|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})")
+
+# 倒计时文案：新版页面可能写成 "Renewal cooldown"，小时也可能只有一位
+CD_RE = r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})"
+
+
 def extract_expiry_date(page_source: str) -> str:
-    patterns = [
-        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
-        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
-        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", # 2026/07/07 - renew manually to extend for 4 days
-    ]
-    for pattern in patterns:
+    for pattern in (r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE, DATE_RE):
         match = re.search(pattern, page_source)
         if match:
-            date_str = match.group(1)
-            # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
-            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
-                parts = date_str.split('/')
-                if len(parts[0]) == 2:  # 第一部分是2位（月）
-                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
-                    return f"{parts[2]}/{parts[0]}/{parts[1]}"
-            return date_str
+            return normalize_date(match.group(1))
     return None
 
-#   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
-DISCORD_CLIENT_ID   = "884382422530158623"
-OAUTH_REDIRECT_URI  = "https://bot-hosting.net/login"
-OAUTH_SCOPE         = "identify email guilds"
-DISCORD_API         = "https://discord.com/api/v9/oauth2/authorize"
-DISCORD_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-)
-STATE_RE = re.compile(r"[?&]state=([^&]+)")
+
+def get_expiry_from_dom(sb) -> str:
+    """优先从 st-meta 元素取到期日 —— 站点用它渲染，比全文正则抗改版。"""
+    for selector in ("span.st-meta", ".st-meta", '[class*="st-meta"]'):
+        try:
+            if sb.is_element_present(selector):
+                match = re.search(DATE_RE, sb.get_text(selector))
+                if match:
+                    return normalize_date(match.group(1))
+        except Exception:
+            pass
+    return None
 
 
-def capture_discord_state(sb) -> str:
-    """打开 /login/discord，从落地页 URL 里提取本次会话的 state"""
-    print("🔎 获取 Discord OAuth state...")
-    sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", reconnect_time=4)
-    time.sleep(2)
-
-    url = sb.get_current_url()
-    if "discord.com" not in url:
-        print(f"⚠️ 未跳转到 Discord 相关页面，当前 URL：{url}")
-        return ""
-
-    m = STATE_RE.search(url)
-    if not m:
-        print(f"❌ 未能从 URL 中解析出 state，当前 URL：{url}")
-        return ""
-
-    state = urllib.parse.unquote(m.group(1))
-    print(f"✅ 已捕获 state（当前落地页：{urllib.parse.urlparse(url).path}）")
-    return state
-
-
-def discord_authorize(state: str) -> str:
-    """用 DC_TOKEN 直接完成 Discord 侧授权，返回跳转回 bot-hosting.net 的 location"""
-    query = urllib.parse.urlencode({
-        "client_id":     DISCORD_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri":  OAUTH_REDIRECT_URI,
-        "scope":         OAUTH_SCOPE,
-        "state":         state,
-    })
-    authorize_url = f"{DISCORD_API}?{query}"
-
-    referer = (
-        "https://discord.com/oauth2/authorize?" +
-        urllib.parse.urlencode({
-            "client_id":     DISCORD_CLIENT_ID,
-            "redirect_uri":  OAUTH_REDIRECT_URI,
-            "response_type": "code",
-            "scope":         OAUTH_SCOPE,
-            "state":         state,
-        })
-    )
-
-    headers = {
-        "accept":           "*/*",
-        "authorization":    DC_TOKEN,
-        "content-type":     "application/json",
-        "origin":           "https://discord.com",
-        "referer":          referer,
-        "user-agent":       DISCORD_UA,
-        "x-discord-locale": "zh-CN",
-    }
-
-    body = json.dumps({
-        "permissions": "0",
-        "authorize": True,
-        "integration_type": 0,
-        "location_context": {
-            "guild_id": "10000",
-            "channel_id": "10000",
-            "channel_type": 10000,
-        },
-    })
-
-    # 如果配置了代理，Discord API 请求也走代理
-    proxies = None
-    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    if _is_proxy:
-        proxies = {"http": _proxy_server, "https": _proxy_server}
-
-    try:
-        resp = requests.post(authorize_url, headers=headers, data=body, proxies=proxies, timeout=20)
-        if resp.status_code != 200:
-            print(f"❌ Discord OAuth2 授权失败: HTTP {resp.status_code} - {resp.text[:300]}")
-            return ""
-        resp_data = resp.json()
-    except Exception as e:
-        print(f"❌ Discord OAuth2 授权异常: {e}")
-        return ""
-
-    location = resp_data.get("location", "")
-    if not location:
-        print(f"❌ 授权响应中未找到 location 字段: {resp_data}")
-        return ""
-
-    masked = re.sub(r"code=[^&]+", "code=***", location)
-    print(f"✅ 拿到回调 URL: {masked}")
-    return location
-
-
-def do_discord_login(sb) -> bool:
-    """通过 Discord Token 走完整 OAuth 流程登录 bot-hosting.net"""
-    print("\n🔑 通过 Discord Token 登录...")
-
-    state = capture_discord_state(sb)
-    if not state:
-        sb.save_screenshot("login_no_state.png")
-        return False
-
-    location = discord_authorize(state)
-    if not location:
-        return False
-
-    print("↩️ 携带授权码打开回调链接...")
-    sb.uc_open_with_reconnect(location, reconnect_time=4)
-    time.sleep(3)
-
-    url = sb.get_current_url()
-
-    if "/error/banned" in url:
-        print("🚫 账号已被封禁")
-        sb.save_screenshot("login_banned.png")
-        return False
-
-    if "bot-hosting.net" not in url:
-        print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
-        sb.save_screenshot("login_no_redirect.png")
-        return False
-
-    try:
-        body_text = sb.get_text("body")
-    except Exception:
-        body_text = ""
-    if "fraud" in body_text.lower():
-        print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
-        sb.save_screenshot("login_fraud.png")
-        return False
-
-    for _ in range(30):
-        url = sb.get_current_url()
-        path = urllib.parse.urlparse(url).path
-        if "bot-hosting.net" in url and path != "/login" and not path.startswith("/login/discord"):
-            print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
-            return True
-        time.sleep(0.5)
-
-    print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
-    try:
-        body_text = sb.get_text("body")
-        print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
-    except Exception:
-        pass
-    sb.save_screenshot("login_timeout.png")
-    return False
-
+def open_billings(sb) -> str:
+    """打开账单页：优先新路径 /dash/billings，失败回落 /a/billings，返回最终 URL。"""
+    last_url = ""
+    for path in BILLINGS_PATHS:
+        try:
+            url = BASE_URL + path
+            print(f"🌐 访问 {url} ...")
+            sb.open(url)
+            sb.wait_for_ready_state_complete()
+            sb.sleep(3)
+            last_url = sb.get_current_url()
+            if "billings" in last_url and "/login" not in last_url and "error=" not in last_url:
+                return last_url
+            print(f"⚠️ {path} 未落到账单页，当前URL: {last_url}")
+        except Exception as e:
+            print(f"⚠️ 访问 {path} 异常: {e}")
+    return last_url
 
 # 主流程
 def main():
@@ -363,15 +213,16 @@ def main():
     PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
 
-    sb_kwargs = {"uc": True, "headless": HEADLESS}
+    # locale_code 固定 en-US：脚本所有选择器（Renew free plan / Renew in）都是英文文案，
+    # 站点会按浏览器语言切换界面（弹窗中文版出现过「续期 4 天」）。
+    # 不锁语言，等于把成败押在 runner 的默认 locale 上 —— 上游同样锁了 en-US。
+    sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
 
     if IS_PROXY:
         print(f"🔗 挂载代理: {PROXY_SERVER}")
         sb_kwargs["proxy"] = PROXY_SERVER
     else:
         print("🍭 未使用代理，直连访问")
-
-    global _LOGIN_METHOD
 
     with SB(**sb_kwargs) as sb:
         try:
@@ -382,69 +233,65 @@ def main():
 
         login_ok = False
 
-        # 方式1: SESSION_TOKEN Cookie 登录（默认）
-        if SESSION_TOKEN:
+        # ── 账号密码登录（唯一方式）──
+        # bot-hosting 已废弃 SESSION_TOKEN / Discord OAuth 两种入口，密码是唯一稳定路径。
+        # 流程与上游 eooce 2026-10-21 的实装一致：
+        #   /login → 点「Continue with email」→ 填邮箱密码 → 过 Turnstile → 提交 → 验证 /a/billings
+        if EMAIL and PASSWORD:
             print("🚀 启动浏览器...")
-            sb.open("https://bot-hosting.net/")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
-
-            print("📝 注入 Cookie...")
-            for name, value in COOKIES.items():
-                if value:
-                    sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
-
-            print("🌐 访问 https://bot-hosting.net/a/billings ...")
-            sb.open("https://bot-hosting.net/a/billings")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-            current_url = sb.get_current_url()
-            current_title = sb.get_title()
-            print(f"📝 当前URL: {current_url}, Title: {current_title}")
-
-            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
-                login_ok = True
-                print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
-            else:
-                print(f"❌ SESSION_TOKEN 登录失败，当前URL: {current_url}, 当前标题: {current_title}")
-
-        # 方式2: Discord OAuth 登录（备用）
-        if not login_ok and DC_TOKEN:
-            _LOGIN_METHOD = "Discord Token"
-            print("\n🔄 SESSION_TOKEN 登录失败或未配置，尝试 Discord OAuth 登录...")
-            if do_discord_login(sb):
-                print("🌐 访问 https://bot-hosting.net/a/billings ...")
-                sb.open("https://bot-hosting.net/a/billings")
+            try:
+                print("🌐 访问 https://bot-hosting.net/login")
+                sb.open("https://bot-hosting.net/login")
                 sb.wait_for_ready_state_complete()
                 sb.sleep(3)
-                current_url = sb.get_current_url()
+
+                # 首屏是登录方式选择页，先点「Continue with email」展开表单
+                sb.click('button[type="submit"]')
+                sb.sleep(12)
+
+                print("📧 填写邮箱...")
+                sb.input('input[type="email"]', EMAIL)
+                sb.sleep(1)
+                print("🔑 填写密码...")
+                sb.input('input[type="password"]', PASSWORD)
+                sb.sleep(3)
+
+                # 登录页同样有 Turnstile
+                if not wait_for_turnstile_pass(sb, timeout=25):
+                    print("⚠️ 登录页 Turnstile 未通过，尝试兜底点击...")
+                    try:
+                        sb.uc_gui_click_captcha()
+                        sb.sleep(4)
+                    except Exception as e:
+                        print(f"⚠️ 兜底点击失败: {e}")
+
+                sb.sleep(1)
+                sb.click('button[type="submit"]')
+                print("🖱️ 提交登录按钮")
+                sb.sleep(6)
+                sb.wait_for_ready_state_complete()
+
+                current_url = open_billings(sb)
                 current_title = sb.get_title()
                 print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-                if "a/billings" in current_url:
+                if ("billings" in current_url and "/login" not in current_url
+                        and "error=" not in current_url):
                     login_ok = True
-                    print("✅ Discord OAuth 登录成功,当前已到达账单页")
+                    print("✅ Password 登录成功, 当前已到达账单页")
                 else:
-                    print(f"❌ Discord OAuth 登录后仍未到达账单页，当前URL: {current_url}")
-            else:
-                print("❌ Discord OAuth 登录失败")
+                    print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
+            except Exception as e:
+                print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
 
         if not login_ok:
-            error_msg = "Cookie 已失效或页面异常"
-            if not SESSION_TOKEN and DC_TOKEN:
-                error_msg = "Discord OAuth 登录失败"
-            elif SESSION_TOKEN and DC_TOKEN:
-                error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
-            send_telegram_message(format_notification("❌ 登录失败", error=error_msg))
+            send_telegram_message(format_notification("❌ 登录失败", error="Password 登录失败"))
             return
 
-        if _LOGIN_METHOD == "Discord Token":
-            print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
-
-        # 提取当前到期日期
+        # 提取当前到期日期（优先 DOM 的 st-meta，比全文正则抗改版）
         sb.sleep(2)
         page_source = sb.get_page_source()
-        current_expiry = extract_expiry_date(page_source)
+        current_expiry = get_expiry_from_dom(sb) or extract_expiry_date(page_source)
         if current_expiry:
             print(f"📅 当前到期日期: {current_expiry}")
         else:
@@ -455,21 +302,23 @@ def main():
         countdown_text = None
 
         # 页面级倒计时优先判定：
-        # 冷却期内页面上一定存在 "Renew in HH:MM:SS"。只要出现，就说明还没到可续期时间，
-        # 直接走「未到时间」分支 —— 避免被 [class*="renew"] 之类的选择器误匹配到别的元素，
-        # 把冷却期内的按钮当成可点；点下去必然无变化，进而误报「续期可能未成功」。
+        # 冷却期内页面上一定存在 "Renew in HH:MM:SS" 或 "Renewal cooldown HH:MM:SS"。
+        # 只要出现，就说明还没到可续期时间，直接走「未到时间」分支 ——
+        # 避免被宽泛选择器误匹配到别的元素，把冷却期内的按钮当成可点。
         page_html = sb.get_page_source()
-        page_cd = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", page_html)
+        page_cd = re.search(CD_RE, page_html)
         if page_cd:
             countdown_text = page_cd.group(1)
             print(f"⏳ 页面显示倒计时 {countdown_text}，判定为未到续期时间")
 
+        # 选择器顺序：精确的排前面。
+        # 旧的 [class*="renew"] / button:contains("Renew") 过于宽泛，容易命中非续期元素，
+        # 上游 2026-11-12 已把它们删掉，这里同步收紧。
         possible_selectors = [
-            'button:contains("Renew")',
             'button:contains("Renew free plan")',
+            'type:button("Renew free plan")',
+            'button:contains("Renew")',
             'a:contains("Renew")',
-            '[class*="renew"]',
-            '[class*="Renew"]',
         ]
 
         # 已从页面文本里读到倒计时，就不再找按钮，直接走「未到时间」分支
@@ -477,16 +326,15 @@ def main():
             try:
                 if sb.is_element_visible(selector):
                     button_text = sb.get_text(selector)
-                    if "Renew in" in button_text:
-                        match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
-                        if match:
-                            countdown_text = match.group(1)
+                    m_cd = re.search(CD_RE, button_text)
+                    if m_cd:
+                        countdown_text = m_cd.group(1)
                         break
                     elif "Renew" in button_text and "in" not in button_text.lower():
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
-            except Exception as e:
+            except Exception:
                 pass
 
         # 点击外部续期按钮等待弹窗
@@ -616,7 +464,7 @@ def main():
                 # 先看到期日变没变：变了就是真成功，不必纠结弹窗关没关。
                 # （2026-11-09 实测：点击其实已生效，但弹窗关闭有延迟，只看弹窗会误判。）
                 try:
-                    now_expiry = extract_expiry_date(sb.get_page_source())
+                    now_expiry = get_expiry_from_dom(sb) or extract_expiry_date(sb.get_page_source())
                     if now_expiry and current_expiry and now_expiry != current_expiry:
                         modal_button_clicked = True
                         print(f"✅ 到期日已更新为 {now_expiry}，续期已生效")
@@ -655,23 +503,26 @@ def main():
 
             # 提取新的到期日期和倒计时
             new_page_text = sb.get_page_source()
-            new_expiry = extract_expiry_date(new_page_text)
-            new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+            new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
+            new_match = re.search(CD_RE, new_page_text)
 
             waited = 0
             while (not new_match) and (not new_expiry or new_expiry == current_expiry) and waited < CONFIRM_TIMEOUT:
                 sb.sleep(CONFIRM_INTERVAL)
                 waited += CONFIRM_INTERVAL
-                print(f"   …已等 {waited} 秒未读到新的到期信息，重新加载账单页确认")
+                print(f"   …已等 {waited} 秒未读到新的到期信息，刷新账单页确认")
                 try:
-                    sb.open("https://bot-hosting.net/a/billings")
+                    # 用 refresh 而不是重新 open：等同用户按 F5，
+                    # 且不会因站点路径迁移（/a → /dash）而撞 404。
+                    sb.refresh()
                     sb.wait_for_ready_state_complete()
                     sb.sleep(2)
                 except Exception as e:
-                    print(f"   ⚠️ 重新加载账单页失败: {e}")
+                    print(f"   ⚠️ 刷新失败，改走直连账单页: {e}")
+                    open_billings(sb)
                 new_page_text = sb.get_page_source()
-                new_expiry = extract_expiry_date(new_page_text)
-                new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+                new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
+                new_match = re.search(CD_RE, new_page_text)
 
             if new_match:
                 new_countdown = new_match.group(1)
@@ -709,8 +560,8 @@ def main():
             if countdown_text:
                 friendly = format_countdown(countdown_text)
                 if is_recently_renewed(countdown_text):
-                    # 倒计时 23~24 小时 → 不到 1 小时前刚续期过 → 前序（主触发）已成功
-                    # 静默处理：不推送通知、不重复操作；SESSION_TOKEN 仍照常刷新
+                    # 倒计时 23~24 小时 → 不到 1 小时前刚续期过（例如月末 31→1 边界连跑两天）
+                    # 静默处理：不推送通知、不重复操作
                     print(f"✅ 前序已续期完成（倒计时 {countdown_text}），本次无需操作，不发通知")
                 else:
                     print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
@@ -731,24 +582,6 @@ def main():
                     )
                 )
 
-        # 更新SESSION_TOKEN 
-        print("🔄 检查 SESSION_TOKEN 是否需要更新")
-        new_token, token_expiry = get_cookie_info(sb, "session_token")
-        old_token = SESSION_TOKEN
-
-        if should_update_cookie(new_token, old_token, token_expiry):
-            print("🔄 SESSION_TOKEN 需要更新")
-            if GH_TOKEN:
-                if update_github_secret("SESSION_TOKEN", new_token):
-                    print("✅ SESSION_TOKEN 更新成功")
-                else:
-                    print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
-            else:
-                print("⚠️ 未设置 GH_TOKEN，无法自动更新")
-                print(f"📋 请手动设置 SESSION_TOKEN = {new_token[:4]}...{new_token[-4:]}")
-        else:
-            print("✅ SESSION_TOKEN 无需更新")
-        
         print("🏁 脚本执行完毕")
 
 if __name__ == "__main__":
