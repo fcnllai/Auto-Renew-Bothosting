@@ -12,7 +12,7 @@
 
 | Secret 名称         | 是否必填 | 说明                                              |
 |---------------------|----------|---------------------------------------------------|
-| EMAIL              | ✅ 必填  | 用于登录和通用的Email,必填                          |
+| EMAIL              | ✅ 必填  | 用于登录和通知的Email,必填                          |
 | PASSWORD           | ✅ 必填  | 登录密码,必填                                      |
 | NODE_LINK          | ❌ 可选  | 代理链接（如 vless:// vmess:// trojan:// hysteria2:// tuic:// anytls:// socks5:// )|
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
