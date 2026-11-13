@@ -27,17 +27,19 @@
 
 3：去actions菜单手动试运行工作流,根据自己的服务到期日期自行在[renew.yml](.github/workflows/renew.yml)里调整cron运行时间
 
-**## 注意事项
+
+## 注意事项
 * 必填变量必须要填写
 * NODE_LINK支持的代理协议有：vmess,vless,hysteria2,tuic,anytls,socks5等
 * cron运行时间不一定准确,得根据实际到期时间修改,可在设置里暂停actions功能再开启
+**
 
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，如转载须注明来源。
 * 使用本程序必循遵守部署服务器所在地、所在国家和用户所在国家的法律法规, 程序作者不对使用者任何不当行为负责。
 **
 
-### TOKEN都不再必需，保留说明只为防止官方哪天又改回：）
+### TOKEN不再需要，保留说明只为防止官方改回旧模式:）
 ### SESSION_TOKEN 获取
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
 <img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/e532b0d6-9f12-45fd-8af9-69e1029a1a92" />
