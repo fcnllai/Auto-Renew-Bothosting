@@ -78,7 +78,8 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
 # 旧写法只看页面里有没有 "verify you are human" 字样，但挑战界面在 iframe 内部，
 # get_page_source() 读不到，于是无论过没过都判定「已通过」—— 带着空 token 提交，
 # 服务端回 error=disconnect。这就是 11-13 登录失败的真正原因，该函数已删除。
-# 唯一可靠判据：表单里的 cf-turnstile-response 有没有值（上游同款做法）。
+# 注意：token 只能当参考信号，不能当门槛 —— 2026-11-13 16:52 实测，
+# 本站即便一句 token 都读不到，登录照样成功。硬卡 token 反而把流程卡死。
 TURNSTILE_TOKEN_JS = r"""
 try { if (window.turnstile && window.turnstile.getResponse) {
         var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
@@ -293,24 +294,21 @@ def main():
                 sb.input('input[type="password"]', PASSWORD)
                 sb.sleep(3)
 
-                # 登录页的 Turnstile：必须等到 token 真正写入表单才允许提交。
-                # 拿不到 token 就点验证框，最多三轮，每轮最多等 20 秒。
-                tok = wait_turnstile_token(sb, timeout=10)
+                # 登录页的 Turnstile：先等 8 秒，没有就点一次再等 10 秒，然后直接提交。
+                # 实测 2026-11-13 16:52：即使一句 token 都读不到，登录依然成功到达账单页。
+                # 说明本站 Turnstile 并不依赖 cf-turnstile-response 这个字段 ——
+                # token 只能当参考信号，绝不能当提交前的硬门槛，否则自己把自己卡死。
+                tok = wait_turnstile_token(sb, timeout=8)
                 if not tok:
-                    print("⚠️ 未取得 Turnstile token，尝试点击验证框...")
-                    for attempt in range(1, 4):
-                        try:
-                            sb.uc_gui_click_captcha()
-                        except Exception as e:
-                            print(f"⚠️ 第 {attempt} 次点击验证框失败: {e}")
-                        tok = wait_turnstile_token(sb, timeout=20)
-                        if tok:
-                            break
-                        print(f"⚠️ 第 {attempt} 次点击后仍无 token，重试")
+                    try:
+                        sb.uc_gui_click_captcha()
+                    except Exception as e:
+                        print(f"⚠️ 点击登录页验证框失败: {e}")
+                    tok = wait_turnstile_token(sb, timeout=10)
                 if tok:
-                    print(f"✅ Turnstile token 已就绪（{tok[:10]}… 长度 {len(tok)}）")
+                    print(f"✅ Turnstile token 就绪（{tok[:10]}… 长度 {len(tok)}）")
                 else:
-                    print("❌ 始终未取得 Turnstile token，提交大概率会被拒")
+                    print("ℹ️ 未读到 token —— 登录页实测不依赖该字段，继续提交")
 
                 sb.sleep(1)
                 sb.click('button[type="submit"]')
@@ -416,8 +414,8 @@ def main():
                 return
 
             # 处理弹窗中的 Turnstile
-            # 判据同样改为「token 是否有值」：无感验证常常自动通过，先等 8 秒；
-            # 拿不到再点验证框，最多三轮。
+            # 判据同样不能过硬：token 读不到 ≠ 验证没通过，登录页已经用事实证伪
+            # （无 token 照样登录成功）。所以这里只做「尽量点通」，绝不 return。
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
             if wait_turnstile_token(sb, timeout=8):
@@ -431,16 +429,14 @@ def main():
                     except Exception as e:
                         print(f"⚠️ 点击 Turnstile 出错: {e}")
 
-                    if wait_turnstile_token(sb, timeout=20):
+                    if wait_turnstile_token(sb, timeout=10):
                         turnstile_passed = True
                         print(f"✅ 第 {attempt} 次点击后 token 就绪")
                         break
-                    print(f"⏳ 第 {attempt} 次仍未取得 token，重试点击...")
+                    print(f"⏳ 第 {attempt} 次点击后仍无 token")
 
-            if not turnstile_passed:
-                print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                return
+                if not turnstile_passed:
+                    print("⚠️ 弹窗同样读不到 token —— 但登录页证明这不等于失败，继续尝试续期")
 
             # ── 点击续期按钮（2026-11-09 改版适配）──
             # 站点在 11-07 → 11-09 之间改版：弹窗改为中文「续期 4 天」，
@@ -520,7 +516,9 @@ def main():
                             print(f"🖱️ 第 {rnd} 轮点击弹窗主按钮：{sel}")
                             hit = True
                             break
-                    except Exception:
+                    except Exception as e:
+                        # 常见于按钮仍 disabled（验证未完成时它是灰的），点不动
+                        print(f"⚠️ 第 {rnd} 轮点击 {sel} 失败: {str(e)[:90]}")
                         continue
 
                 # 兜底：按中英文文案用 JS 触发
